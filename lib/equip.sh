@@ -1,5 +1,6 @@
+#!/usr/bin/env bash
 # shellcheck shell=bash
-# equip / setup helpers for claude-farm — sourced by farm.sh
+# equip / setup helpers for usage-farm — sourced by farm.sh
 # Uses Vercel skills CLI (npx skills) with CLAUDE_CONFIG_DIR pointed at
 # the per-account home so installs land on the mounted volume.
 
@@ -467,7 +468,7 @@ cmd_setup() {
   local home
   home="$(acct_home "$acct")"
 
-  echo "claude-farm setup — account: $acct"
+  echo "usage-farm setup — account: $acct"
   echo "home: $home"
   echo "host skills: $(host_skills_dir)"
   echo

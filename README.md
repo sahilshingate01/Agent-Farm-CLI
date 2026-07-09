@@ -1,11 +1,12 @@
-# claude-farm
+# usage-farm
 
-**N isolated Claude Code accounts on one Mac.**  
+**N isolated AI accounts on one Mac.**  
 CLI: `farm`
 
-Each account is a lightweight Linux VM (Apple’s native `container` CLI — macOS 26+, Apple Silicon), logged into its **own** Claude OAuth. No shared Keychain, no credential collisions, no agents touching your real home directory.
+Each account runs in its own Apple container VM with separate provider state:
+`claude`, `codex`, `grok`, `gemini`, etc. No shared Keychain, no credential collisions.
 
-![claude-farm — isolated Claude Code VMs on a Mac host](docs/hero.jpg)
+![usage-farm — isolated AI VMs on a Mac host](docs/hero.jpg)
 
 ---
 
@@ -16,20 +17,21 @@ Each account is a lightweight Linux VM (Apple’s native `container` CLI — mac
 | Layer | What | Where |
 |---|---|---|
 | **CLI / tooling** | `farm` | this repo — **in git** |
-| **Per-account state** | OAuth, skills, agents, MCP, settings | `~/.claude-farm/accounts/<name>/claude-home` — **never in git** |
-| **Shared workspace** | bare repos + worktrees | `~/.claude-farm/work` — mounted at the **same absolute path** on host and in every VM |
+| **Per-account state** | provider home directories, skills, agents, MCP, settings | `~/.usage-farm/accounts/<name>/` — **never in git** |
+| **Shared workspace** | bare repos + worktrees | `~/.usage-farm/work` — mounted at the **same absolute path** on host and in every VM |
 
 ```
 ┌─ Host (macOS) ─────────────────────────────────────────────┐
 │  farm  ·  farm setup  ·  farm equip                        │
-│  ~/.claude-farm/accounts/<acct>/claude-home  ──┐           │
-│  ~/.claude-farm/work  ──────────────────────┐  │           │
-└─────────────────────────────────────────────│──│───────────┘
+│  ~/.usage-farm/accounts/<acct>/claude-home  ──┐             │
+│  ~/.usage-farm/accounts/<acct>/codex-home   ──┤             │
+│  ~/.usage-farm/work  ──────────────────────┐  │             │
+└─────────────────────────────────────────────│──│─────────────┘
                                               │  │
          ┌────────────────────────────────────┘  │
          ▼                                       ▼
-   shared work/                    /root/.claude  (private)
-   (identical path)                per-account kit
+   shared work/                         /root/.claude
+   (identical path)                    per-account provider homes
          ▲
    ┌─────┴──────┬──────────────┬──────────────┐
    │  VM hello  │  VM sahil    │  VM acct N   │
@@ -37,7 +39,7 @@ Each account is a lightweight Linux VM (Apple’s native `container` CLI — mac
    └────────────┴──────────────┴──────────────┘
 ```
 
-Isolation is structural: each VM has no macOS Keychain, so credentials stay per-account files on the host volume.
+Isolation is structural: each VM has no macOS Keychain, so credentials stay in per-account files on the host volume.
 
 ---
 
@@ -55,9 +57,11 @@ Isolation is structural: each VM has no macOS Keychain, so credentials stay per-
 ```bash
 # one-time image
 ./farm.sh build
+# for extra provider clients, build once with:
+# docker build -t usage-agent --build-arg EXTRA_AI_CLIENTS="<npm-packages>" .
 
 # shell aliases (defines `farm` + per-account shortcuts)
-echo 'source /path/to/claude-farm/farm-aliases.sh' >> ~/.zshrc
+echo 'source /path/to/usage-farm/farm-aliases.sh' >> ~/.zshrc
 ```
 
 Aliases from `farm-aliases.sh`:
@@ -65,31 +69,74 @@ Aliases from `farm-aliases.sh`:
 | Alias | Runs |
 |---|---|
 | `farm` | main CLI |
-| `claude-farm` | synonym for `farm` |
-| `claude-<acct>` | `farm claude <acct>` — generated automatically for every existing account |
+| `usage-farm` | synonym for `farm` |
+| `claude-farm` | legacy synonym for `farm` |
+| `usage-<acct>` | `farm run claude <acct>` — generated automatically for every existing account |
+| `claude-<acct>` | legacy compatibility alias |
 
 ---
 
 ## Quick start
 
 ```bash
-farm build                      # one-time image
-farm new hello sahil            # any names, any count
-farm login hello                # /login in the VM; open URL on Mac, paste code
-farm setup hello                # skills + MCP wizard (Vercel skills CLI)
+farm build                          # one-time image
+farm new hello sahil                # any names, any count
+farm login hello claude             # /login for Claude
+farm login hello codex              # open your codex auth flow in that VM
+farm setup hello                    # skills + MCP wizard (Claude-specific tooling)
 farm clone git@github.com:you/repo.git
-farm wt repo hello              # worktree + branch for that account
-farm claude hello wt-repo-hello
+farm wt repo hello                  # worktree + branch for that account
+farm run claude hello wt-repo-hello  # run provider in that worktree
+farm run codex hello wt-repo-hello   # same container, different provider
+farm run gemini hello wt-repo-hello  # run another client in same VM
 ```
+
+## Migration from `claude-farm`
+
+- `~/.usage-farm` is used by default; if it does not exist and `~/.claude-farm` exists, the legacy path is used automatically.
+- Legacy container naming (`claude-<acct>`) is still supported for existing accounts.
+- Legacy aliases (`claude-farm`, `claude-<acct>`) remain as compatibility shims.
+
+---
+
+## Multi-provider commands
+
+- `farm run <provider> <acct> [dir]` — run any client inside the account container
+- `farm claude|codex|grok|gemini <acct> [dir]` — convenience aliases for common clients
+- `farm login <acct> [provider]` — open client for first-time auth
+- For any other provider, keep directory naming as `<acct>/<provider>-home` and command name as `<provider>` to keep mounting and launch behavior predictable.
+
+Container startup mounts these default provider homes:
+
+- `~/.usage-farm/accounts/<acct>/claude-home` -> `/root/.claude`
+- `~/.usage-farm/accounts/<acct>/codex-home` -> `/root/.codex`
+- `~/.usage-farm/accounts/<acct>/grok-home` -> `/root/.grok`
+- `~/.usage-farm/accounts/<acct>/gemini-home` -> `/root/.gemini`
+
+If your provider client needs extra install steps or different auth paths, set `FARM_IMAGE` to a custom image and install it there.
+If you use a custom image, keep the container binary command available in `$PATH` (example: `codex`, `grok`, `gemini`) and mount its home as `<acct>/<provider>-home`.
+
+## Adding a custom provider
+
+- Add a client binary to the container image (for example via npm or apt), then rebuild:
+  - `docker build -t usage-agent --build-arg EXTRA_AI_CLIENTS="<packages>" .`
+  - If the provider is not npm-based, install it in a custom `Dockerfile` and set `FARM_IMAGE` to that rebuilt tag (for example, `export FARM_IMAGE=my-usage-image`).
+- Launch with `farm run <provider> <acct> [dir]` where `<provider>` matches the executable name.
+- Store credentials and config in `~/.usage-farm/accounts/<acct>/<provider>-home` (automatically mounted at `/root/.<provider>` by default).
+- Verify:
+  - `farm login <acct> <provider>` opens the auth flow for first setup.
+  - `./farm.sh up <acct> && ./farm.sh run <provider> <acct>` should execute the CLI inside the VM.
+- Optional per-account alias patterns:
+  - Existing helper aliases are `usage-<acct>` / `claude-<acct>`; create custom aliases manually in your shell as needed.
 
 ---
 
 ## Skills, MCP, and profiles
 
-Containers start with a **blank** Claude home (no host plugins/hooks). Equip them deliberately:
+Containers start with a **blank Claude home** by default (no host plugins/hooks). Equip them deliberately:
 
 ```bash
-farm setup hello                      # interactive wizard
+farm setup hello                      # interactive wizard (Claude-centric)
 farm equip hello --profile coding     # non-interactive
 farm equip hello --list               # inventory
 farm profiles                         # bundled profiles + MCP catalog
@@ -99,9 +146,9 @@ farm profiles                         # bundled profiles + MCP catalog
 
 1. **Baseline profile** — `blank` · `minimal` · `coding` · `frontend` · `custom`
 2. **Vercel skills CLI** — installs with  
-   `CLAUDE_CONFIG_DIR=~/.claude-farm/accounts/<acct>/claude-home`  
+   `CLAUDE_CONFIG_DIR=~/.usage-farm/accounts/<acct>/claude-home`  
    so packages land on the mounted volume and appear inside the container
-3. **Host picks** — multi-select (fzf) of skills / agents / commands from `~/.claude` — **copied**, not symlinked (host skill trees often live under `~/Library/...`, invisible in Linux VMs)
+3. **Host picks** — multi-select (fzf) of skills / agents / commands from `~/.claude` — **copied**, not symlinked
 4. **MCP catalog** — container-safe servers only (`context7`, `playwright`, `filesystem`)
 
 | Bundled profile | Intent |
@@ -112,10 +159,7 @@ farm profiles                         # bundled profiles + MCP catalog
 
 Profiles: `profiles/*.json`  
 MCP entries: `mcp-catalog/*.json`  
-Applied stamp: `~/.claude-farm/accounts/<acct>/profile.json`
-
-**Not copied:** host hooks (macOS paths / binaries break in the VM).  
-**Not auto-enabled:** host-only MCP (e.g. Tolaria under `/Applications`).
+Applied stamp: `~/.usage-farm/accounts/<acct>/profile.json`
 
 ```
 farm setup / equip
@@ -125,11 +169,11 @@ farm setup / equip
         └─► merge mcp-catalog → account .mcp.json
                     │
                     ▼
-     ~/.claude-farm/accounts/<acct>/claude-home/
+     ~/.usage-farm/accounts/<acct>/claude-home/
          skills/  agents/  commands/  .mcp.json  profile.json
                     │
                     ▼  (bind-mounted)
-              /root/.claude  inside the VM
+              /root/.claude inside the VM
 ```
 
 ---
@@ -137,23 +181,27 @@ farm setup / equip
 ## Commands
 
 ```
-farm build                     build/rebuild the claude-agent image
+farm build                     build/rebuild the usage-agent image
 farm new <acct>...             create + start account container(s)
-farm login <acct>              interactive claude for first /login
+farm login <acct> [provider]   interactive auth for provider
 farm up [acct...]              start all (or named) account containers
 farm down [acct...]            stop all (or named)
 farm ls                        accounts, running state, auth, email
 farm rename <old> <new>        rename account (auth preserved)
 farm clone <url> [name]        bare-clone into shared work/
 farm wt <repo> <acct> [br]     per-account worktree
+farm run <provider> <acct> [dir]  run provider CLI
 farm claude <acct> [dir]       run claude in that container
+farm codex <acct> [dir]        run codex in that container
+farm grok <acct> [dir]         run grok in that container
+farm gemini <acct> [dir]       run gemini in that container
 farm shell <acct>              bash inside the container
 farm rm <acct>...              delete container (state kept)
 
 farm setup <acct>              interactive skills / MCP wizard
 farm equip <acct> --profile X  apply profile non-interactively
 farm equip <acct> --list       show installed kit
-farm profiles [list|show name] bundled profiles + MCP catalog
+farm profiles [list|show <name>] bundled profiles + MCP catalog
 ```
 
 Env overrides: `FARM_STATE` · `FARM_IMAGE` · `FARM_MEM` (default `4g`) · `FARM_CPUS` (default `4`) · `HOST_CLAUDE`
@@ -178,10 +226,10 @@ Idle containers cost little CPU. Stop what you are not using: `farm down acct3`.
 
 ## Notes
 
-- **Auth survives rebuilds** — it lives on the host under `~/.claude-farm/accounts/<name>/claude-home`. Back that up carefully; it holds OAuth tokens.
+- **Auth survives rebuilds** — it lives on the host under `~/.usage-farm/accounts/<name>/` in provider homes. Back it up carefully; it holds tokens.
 - **GitHub from a container:** `farm shell <acct>` → `gh auth login`, and set `git config --global user.email` per account.
+- **Image contents:** Node 22, `git`, `gh`, `rg`, `jq`, and `@anthropic-ai/claude-code` by default. Add other clients by building with `--build-arg EXTRA_AI_CLIENTS`.
 - **Agent separation** inside the shared farm is by convention (one worktree per account). For hard isolation, mount a per-account work dir instead of the shared `work/`.
-- **Image contents:** Node 22, `claude`, `git`, `gh`, `rg`, `jq` — see `Dockerfile`.
 
 ---
 
@@ -193,8 +241,8 @@ Idle containers cost little CPU. Stop what you are not using: `farm down acct3`.
 | `profiles/` · `mcp-catalog/` | equip defaults | yes |
 | `docs/architecture.svg` · `docs/hero.jpg` | diagrams | yes |
 | `farm-aliases.sh` | shell aliases | yes |
-| `~/.claude-farm/accounts/*` | credentials + kit | **no** |
-| `~/.claude-farm/work/` | shared workspace | **no** |
+| `~/.usage-farm/accounts/*` | credentials + kit | **no** |
+| `~/.usage-farm/work/` | shared workspace | **no** |
 
 ---
 
