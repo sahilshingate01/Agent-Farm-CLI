@@ -1,0 +1,23 @@
+{
+  "name": "@agensis/farm",
+  "version": "0.1.0",
+  "description": "Portable control plane for local, remote, and managed Agensis agent silos",
+  "author": "Sahil Shingate",
+  "type": "module",
+  "bin": {
+    "farm": "bin/farm.mjs",
+    "farmd": "bin/farmd.mjs"
+  },
+  "scripts": {
+    "check": "node --check bin/farm.mjs && node --check bin/farmd.mjs && node --check src/*.mjs && node --check src/runtimes/*.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@daytona/sdk": "^0.196.0",
+    "e2b": "^2.32.0"
+  },
+  "license": "MIT"
+}
