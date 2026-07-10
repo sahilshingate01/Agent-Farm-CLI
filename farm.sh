@@ -14,6 +14,7 @@ fi
 
 ACCOUNTS_DIR="$FARM_STATE/accounts"
 WORK="$FARM_STATE/work"
+HOST_DIRS_FILE="$FARM_STATE/host-dirs"
 IMAGE="${FARM_IMAGE:-usage-agent}"
 MEM="${FARM_MEM:-4g}"
 CPUS="${FARM_CPUS:-4}"
@@ -47,16 +48,35 @@ usage-farm — N isolated AI client accounts in Apple containers
   farm down [acct...]            stop all (or named)
   farm ls                        accounts, running state, auth state, email
   farm rename <old> <new>        rename an account (auth preserved)
-  farm clone <url> [name]        bare-clone a repo into the shared farm
-  farm wt <repo> <acct> [br]     per-account worktree on that repo
+  farm clone <url> [name]        bare-clone a repo into the shared farm (idempotent; refreshes)
+  farm wt <repo> <acct> [br] [name]  worktree on that repo (existing/unpushed branch or new)
+  farm wt-ls                     list worktrees: repo, name, branch, path (tab-separated)
+  farm wt-rm <name> [repo]       remove a worktree (keeps its branch)
   farm run <provider> <acct> [dir]
                                 run a provider client in acct's container (dir under work/)
+  farm api-exec <provider> <acct> [--model M] [--dir D]
+                                non-interactive stdin/stdout adapter for the local API gateway
   farm claude <acct> [dir]       run claude in acct's container (dir under work/)
   farm codex <acct> [dir]        run codex in acct's container (dir under work/)
   farm grok <acct> [dir]         run grok in acct's container (dir under work/)
   farm gemini <acct> [dir]       run gemini in acct's container (dir under work/)
   farm shell <acct>              bash inside acct's container
   farm rm <acct>...              delete container (auth/state preserved)
+
+  Share host folders into every local container (virtiofs):
+  farm add-host-dir <path> [target] [--ro]  share a host dir (default: same path, rw)
+  farm host-dirs                 list shared host dirs (local silos only)
+  farm rm-host-dir <path>        stop sharing a host dir
+  farm reload [acct...]          recreate running containers to apply mount changes
+
+  Distributed silos (any machine, E2B, Daytona, and Agensis):
+  farm pair --url <agensis-url>  pair this Farm with an Agensis workspace
+  farm silos                     list local, remote, and managed silos
+  farm silo create <runtime>     create an e2b or daytona managed silo
+  farm silo start|pause|delete   manage a distributed silo
+  farm serve                     run the portable farmd control plane
+  farm models                    list universal gateway model routes
+  farm job run|status|cancel     dispatch, inspect, or cancel a remote coding job
 
   Skills / MCP (per-account home, not host ~/.claude):
   farm setup <acct>              interactive wizard — Vercel skills, host picks, MCP
@@ -158,6 +178,7 @@ known_accounts() {
 
 ensure_provider_dirs() {
   local acct="$1"
+  local provider
   mkdir -p "$ACCOUNTS_DIR/$acct"
   for provider in "${USAGE_PROVIDERS[@]}"; do
     mkdir -p "$(provider_host_home "$acct" "$provider")"
@@ -166,6 +187,7 @@ ensure_provider_dirs() {
 
 start_one() {
   local acct="$1"
+  local provider p home skip
   mkdir -p "$WORK"
   ensure_provider_dirs "$acct"
   if running "$acct"; then
@@ -193,6 +215,23 @@ start_one() {
     $skip || mount_args+=( -v "$home:/root/.$provider" )
   done
   shopt -u nullglob
+
+  # extra host directories shared via virtiofs (farm add-host-dir)
+  if [ -f "$HOST_DIRS_FILE" ]; then
+    while IFS=$'\t' read -r hpath tgt mode; do
+      [ -n "$hpath" ] || continue
+      case "$hpath" in \#*) continue ;; esac
+      if [ ! -d "$hpath" ]; then
+        echo "farm: host-dir missing, skipping: $hpath" >&2
+        continue
+      fi
+      if [ "$mode" = "ro" ]; then
+        mount_args+=( -v "$hpath:${tgt:-$hpath}:ro" )
+      else
+        mount_args+=( -v "$hpath:${tgt:-$hpath}" )
+      fi
+    done < "$HOST_DIRS_FILE"
+  fi
 
   container run -d \
     --name "$(cname "$acct")" \
@@ -235,16 +274,113 @@ run_provider() {
   container exec -it "$container_name" sh -c 'cd "$1" && exec "$2"' sh "$WORK/$sub" "$cmd_name"
 }
 
+run_provider_api() {
+  local provider acct model="" sub="" cmd_name container_name permissions="ask" sandbox="workspace-write" network="ask" allowed_tools="" disallowed_tools=""
+  local -a provider_args=()
+  provider="$(provider_for "$1")"
+  acct="$2"
+  shift 2
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --model)
+        [ $# -ge 2 ] || die "usage: farm api-exec <provider> <acct> [--model M] [--dir D]"
+        model="$2"
+        shift 2
+        ;;
+      --dir)
+        [ $# -ge 2 ] || die "usage: farm api-exec <provider> <acct> [--model M] [--dir D]"
+        sub="$2"
+        shift 2
+        ;;
+      --permissions)
+        permissions="$2"
+        shift 2
+        ;;
+      --sandbox)
+        sandbox="$2"
+        shift 2
+        ;;
+      --network)
+        network="$2"
+        shift 2
+        ;;
+      --allowed-tools)
+        allowed_tools="$2"
+        shift 2
+        ;;
+      --disallowed-tools)
+        disallowed_tools="$2"
+        shift 2
+        ;;
+      *) die "unknown api-exec option: $1" ;;
+    esac
+  done
+
+  provider_is_known "$provider" || die "api-exec does not have an adapter for provider '$provider'"
+  running "$acct" || start_one "$acct"
+  container_name="$(cname_for_account "$acct")"
+  cmd_name="$(provider_command "$provider")"
+
+  if ! container exec "$container_name" sh -lc "command -v '$cmd_name' >/dev/null 2>&1"; then
+    die "missing client '$cmd_name' in container image '$IMAGE'"
+  fi
+
+  case "$provider" in
+    claude)
+      provider_args=(--print --output-format stream-json --include-partial-messages --verbose --no-session-persistence)
+      [ -n "$model" ] && provider_args+=(--model "$model")
+      if [ "$sandbox" = "read-only" ] || [ "$permissions" = "read-only" ]; then
+        provider_args+=(--permission-mode plan)
+      else
+        case "$permissions" in
+          auto) provider_args+=(--permission-mode auto) ;;
+          full) provider_args+=(--permission-mode bypassPermissions --dangerously-skip-permissions) ;;
+          *) provider_args+=(--permission-mode manual) ;;
+        esac
+      fi
+      [ -n "$allowed_tools" ] && provider_args+=(--allowed-tools "$allowed_tools")
+      [ -n "$disallowed_tools" ] && provider_args+=(--disallowed-tools "$disallowed_tools")
+      ;;
+    codex)
+      provider_args=(exec --json --skip-git-repo-check --ephemeral)
+      [ -n "$model" ] && provider_args+=(--model "$model")
+      provider_args+=(--sandbox "$sandbox")
+      case "$permissions" in
+        full) provider_args+=(--dangerously-bypass-approvals-and-sandbox) ;;
+        auto) provider_args+=(--ask-for-approval never) ;;
+        *) provider_args+=(--ask-for-approval on-request) ;;
+      esac
+      provider_args+=(-)
+      ;;
+    grok)
+      provider_args=(--prompt-file /dev/stdin --output-format streaming-json --no-memory)
+      [ -n "$model" ] && provider_args+=(--model "$model")
+      ;;
+    gemini)
+      provider_args=(--prompt "" --output-format stream-json)
+      [ -n "$model" ] && provider_args+=(--model "$model")
+      ;;
+  esac
+
+  container exec -i "$container_name" sh -c 'cd "$1"; shift; exec "$@"' sh \
+    "$WORK/$sub" "$cmd_name" "${provider_args[@]}"
+}
+
 cmd="${1:-help}"; shift || true
 
 # any command that touches the container CLI needs the system service up
 case "$cmd" in
-  build|new|up|down|login|run|claude|codex|grok|gemini|shell|ls|status|rename|rm)
+  build|new|up|down|login|run|api-exec|claude|codex|grok|gemini|shell|ls|status|rename|rm|reload)
     ensure_system
     ;;
 esac
 
 case "$cmd" in
+  pair|silos|silo|serve|models|job)
+    exec node "$REPO_DIR/daemon/bin/farm.mjs" "$cmd" "$@"
+    ;;
+
   build)
     container build -t "$IMAGE" "$REPO_DIR"
     ;;
@@ -288,6 +424,11 @@ case "$cmd" in
     run_provider "$1" "$2" "${3:-}"
     ;;
 
+  api-exec)
+    [ $# -ge 2 ] || die "usage: farm api-exec <provider> <acct> [--model M] [--dir D]"
+    run_provider_api "$@"
+    ;;
+
   claude|codex|grok|gemini)
     [ $# -ge 1 ] || die "usage: farm $cmd <acct> [dir-under-work]"
     run_provider "$cmd" "$1" "${2:-}"
@@ -327,17 +468,142 @@ case "$cmd" in
     [ $# -ge 1 ] || die "usage: farm clone <git-url-or-path> [name]"
     mkdir -p "$WORK"
     name="${2:-$(basename "$1" .git)}"
-    git clone --bare "$1" "$WORK/$name.git"
-    echo "farm: bare repo at $WORK/$name.git — add worktrees with: farm wt $name <acct>"
+    if [ -d "$WORK/$name.git" ]; then
+      # Idempotent: refresh from origin so unpushed/moved local branches are
+      # current before we base worktrees off them.
+      git -C "$WORK/$name.git" fetch --all --prune >/dev/null 2>&1 || true
+      echo "farm: refreshed bare repo at $WORK/$name.git"
+    else
+      git clone --bare "$1" "$WORK/$name.git"
+      echo "farm: bare repo at $WORK/$name.git — add worktrees with: farm wt $name <acct>"
+    fi
     ;;
 
   wt)
-    [ $# -ge 2 ] || die "usage: farm wt <repo> <acct> [branch]"
-    repo="$1"; acct="$2"; branch="${3:-$acct/work}"
+    # farm wt <repo> <acct> [branch] [wtname]
+    #   branch  — base branch (default <acct>/work). Existing branches (incl.
+    #             unpushed ones captured by the bare clone) are checked out;
+    #             unknown names create a new branch.
+    #   wtname  — worktree directory under $WORK (default wt-<repo>-<acct>).
+    [ $# -ge 2 ] || die "usage: farm wt <repo> <acct> [branch] [wtname]"
+    repo="$1"; acct="$2"; branch="${3:-$acct/work}"; wtname="${4:-wt-$repo-$acct}"
     [ -d "$WORK/$repo.git" ] || die "no bare repo $WORK/$repo.git — run: farm clone <url> $repo"
-    git -C "$WORK/$repo.git" worktree add "$WORK/wt-$repo-$acct" -b "$branch" \
-      || git -C "$WORK/$repo.git" worktree add "$WORK/wt-$repo-$acct" "$branch"
-    echo "farm: worktree ready — run: farm run claude $acct wt-$repo-$acct"
+    dest="$WORK/$wtname"
+    [ -e "$dest" ] && die "worktree path already exists: $dest"
+    # Refresh first so a moved/unpushed source branch is current.
+    git -C "$WORK/$repo.git" fetch --all --prune >/dev/null 2>&1 || true
+    if git -C "$WORK/$repo.git" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$WORK/$repo.git" worktree add "$dest" "$branch"
+    else
+      git -C "$WORK/$repo.git" worktree add "$dest" -b "$branch"
+    fi
+    echo "farm: worktree ready — run: farm run claude $acct $wtname"
+    ;;
+
+  wt-ls)
+    # Machine-readable: <repo>\t<wtname>\t<branch>\t<abspath> per worktree.
+    # The name is the path basename (symlink-proof; git records realpaths).
+    mkdir -p "$WORK"
+    for bare in "$WORK"/*.git; do
+      [ -d "$bare" ] || continue
+      repo="$(basename "$bare" .git)"
+      git -C "$bare" worktree list --porcelain 2>/dev/null | awk -v r="$repo" '
+        /^worktree /{wt=substr($0,10); next}
+        /^bare$/{wt=""; next}
+        /^branch /{br=$2; sub(/^refs\/heads\//,"",br)
+          n=split(wt, parts, "/"); name=parts[n]
+          if (wt!="") print r"\t"name"\t"br"\t"wt
+          wt=""}'
+    done
+    ;;
+
+  wt-rm)
+    [ $# -ge 1 ] || die "usage: farm wt-rm <wtname> [repo]"
+    wtname="$1"; dest="$WORK/$wtname"; repo="${2:-}"
+    if [ -z "$repo" ]; then
+      for bare in "$WORK"/*.git; do
+        [ -d "$bare" ] || continue
+        if git -C "$bare" worktree list --porcelain 2>/dev/null \
+             | awk '/^worktree /{n=split($0,p,"/"); print p[n]}' | grep -qx "$wtname"; then
+          repo="$(basename "$bare" .git)"; break
+        fi
+      done
+    fi
+    [ -n "$repo" ] || die "cannot find owning repo for worktree $wtname"
+    git -C "$WORK/$repo.git" worktree remove --force "$dest"
+    echo "farm: removed worktree $wtname"
+    ;;
+
+  add-host-dir)
+    # farm add-host-dir <path> [target] [--ro]
+    #   Share a host directory into every local account container via virtiofs.
+    #   <path> resolves to an absolute physical path (so `.`, relative, ~ all work).
+    #   [target] defaults to the identical absolute path (farm doctrine); rw by default.
+    mode=rw; posargs=()
+    for a in "$@"; do
+      case "$a" in
+        --ro) mode=ro ;;
+        --rw) mode=rw ;;
+        *)    posargs+=("$a") ;;
+      esac
+    done
+    [ ${#posargs[@]} -ge 1 ] || die "usage: farm add-host-dir <path> [target] [--ro]"
+    hpath="$(cd "${posargs[0]}" 2>/dev/null && pwd -P)" || die "not a directory: ${posargs[0]}"
+    tgt="${posargs[1]:-$hpath}"
+    case "$tgt" in /*) ;; *) die "target must be an absolute path: $tgt" ;; esac
+    [ "$tgt" = "$WORK" ] && die "target $tgt would shadow the shared work mount"
+    case "$tgt" in
+      /) die "refusing to mount over /" ;;
+      /root/.claude|/root/.codex|/root/.grok|/root/.gemini) die "target $tgt would shadow a provider home" ;;
+    esac
+    mkdir -p "$FARM_STATE"
+    tmp="$(mktemp)"
+    [ -f "$HOST_DIRS_FILE" ] && awk -F'\t' -v h="$hpath" '$1!=h' "$HOST_DIRS_FILE" > "$tmp"
+    printf '%s\t%s\t%s\n' "$hpath" "$tgt" "$mode" >> "$tmp"
+    mv "$tmp" "$HOST_DIRS_FILE"
+    echo "farm: sharing $hpath -> $tgt ($mode)"
+    echo "farm: apply to running containers with: farm reload"
+    ;;
+
+  host-dirs)
+    # Machine-readable TSV: <host>\t<target>\t<rw|ro>. Local silos only —
+    # remote/managed silos (E2B, Daytona, Agensis) can't see the host FS.
+    if [ -f "$HOST_DIRS_FILE" ] && [ -s "$HOST_DIRS_FILE" ]; then
+      cat "$HOST_DIRS_FILE"
+    else
+      echo "farm: no shared host dirs (local silos only)" >&2
+    fi
+    ;;
+
+  rm-host-dir)
+    [ $# -ge 1 ] || die "usage: farm rm-host-dir <path>"
+    hpath="$(cd "$1" 2>/dev/null && pwd -P)" || hpath="$1"
+    [ -f "$HOST_DIRS_FILE" ] || die "no shared host dirs"
+    tmp="$(mktemp)"
+    awk -F'\t' -v h="$hpath" '$1!=h' "$HOST_DIRS_FILE" > "$tmp"
+    if cmp -s "$HOST_DIRS_FILE" "$tmp"; then
+      rm -f "$tmp"; die "not a shared host dir: $hpath"
+    fi
+    mv "$tmp" "$HOST_DIRS_FILE"
+    echo "farm: unshared $hpath"
+    echo "farm: apply with: farm reload"
+    ;;
+
+  reload)
+    # Recreate running containers so host-dir mount changes take effect.
+    accts=("$@")
+    if [ ${#accts[@]} -eq 0 ]; then
+      while IFS= read -r a; do accts+=("$a"); done < <(known_accounts)
+    fi
+    [ ${#accts[@]} -gt 0 ] || { echo "farm: no accounts"; exit 0; }
+    for a in "${accts[@]}"; do
+      if running "$a"; then
+        container stop "$(cname_for_account "$a")" >/dev/null 2>&1 || true
+        container delete "$(cname_for_account "$a")" >/dev/null 2>&1 || true
+        start_one "$a"
+        echo "farm: reloaded $a"
+      fi
+    done
     ;;
 
   rm)
