@@ -1,4 +1,4 @@
-# Agent-Farm (formerly claude-farm)
+# Agent-Farm (formerly claude-farm / usage-farm)
 
 **N isolated AI accounts on one Mac.**  
 CLI: `farm`
